@@ -10,55 +10,130 @@ import time
 MODEL = "llama-3.1-sonar-small-128k-online"
 
 
+def apply_custom_css():
+    """Applies custom CSS to enlarge fonts for better readability."""
+    st.markdown("""
+        <style>
+            /* Your CSS styles remain the same */
+            .stApp { font-size: 1.1rem; }
+            h3 { font-size: 1.75rem !important; }
+            .stMarkdown p { font-size: 1.25rem; }
+            .stButton > button { font-size: 1.1rem; padding-top: 10px; padding-bottom: 10px; }
+        </style>
+    """, unsafe_allow_html=True)
+
+
 def load_verbs(uploaded_file):
-    """Load verbs from an uploaded file. This runs in the main thread."""
+    """
+    Load verbs from an uploaded file.
+    NEW: Also checks the first line for an API key.
+    Returns: A tuple (list_of_verbs, api_key_or_none)
+    """
     try:
         stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+        lines = stringio.readlines()
+        api_key_from_file = None
+        start_processing_index = 0
+
+        if lines:
+            # Check if the first line looks like a Perplexity API key
+            first_line = lines[0].strip()
+            if first_line.startswith("pplx-") and '[' not in first_line:
+                api_key_from_file = first_line
+                start_processing_index = 1  # Start reading verbs from the next line
+
         verbs = []
-        for line in stringio:
+        # Process only the lines that contain verbs
+        for line in lines[start_processing_index:]:
             if '[' in line and ']' in line:
                 verb, translation = line.split('[', 1)
                 translation = translation.split(']')[0].strip()
                 verbs.append({"Verb": verb.strip(), "Translation": translation})
-        return verbs
+
+        return verbs, api_key_from_file
+
     except Exception as e:
         st.error(f"Error reading or parsing the file: {e}")
-        return None
+        return None, None
 
 
+# The generate_context_sentence, prepare_question_data, and worker_prepare_question functions
+# remain exactly the same as the last version. No changes are needed there.
 def generate_context_sentence(verb, api_key):
-    """API call function. Can be called from any thread."""
+    """
+    API call function. Gets a German sentence and its English translation
+    with high variance and WITHOUT any extra text or reasoning.
+    Returns: (german_sentence, english_translation)
+    """
     if not api_key:
-        return "[API Key not provided]"
+        return "[API Key not provided]", "[Translation not available]"
     try:
         client = OpenAI(api_key=api_key, base_url="https://api.perplexity.ai")
+
+        user_prompt_content = f"""
+I need an A2-level German example sentence for the verb '{verb}'.
+
+**Task Methodology:**
+You MUST randomly select ONE of the following grammatical structures for your sentence. Do not use the same structure every time.
+
+**Structure Menu (Choose ONE randomly):**
+1.  **A sentence with a subordinate clause:** Use conjunctions like `dass`, `obwohl`, `wenn`, `als`, or `bevor`.
+2.  **A sentence with a relative clause:** Use a relative pronoun like `der`, `die`, `das`, or `welchem`.
+3.  **A sentence with an infinitive clause with 'zu':** Use a construction like `um ... zu` or `hat vor ... zu`.
+4.  **A sentence with a modal verb:** Include `müssen`, `können`, `wollen`, `sollen`, or `dürfen`.
+5.  **A complex sentence in the Past Tense (Perfekt or Präteritum).**
+6.  **A sentence in the Future Tense (Futur I).**
+
+---
+**CRITICAL OUTPUT INSTRUCTION:**
+Your entire response MUST strictly contain ONLY the following, in this exact format:
+1. The generated German sentence on the first line.
+2. The separator '|||' on the second line.
+3. The English translation on the third line.
+
+**DO NOT include the menu, your reasoning, your choice, or any other text, explanations, or meta-commentary in your output.**
+"""
+
         messages = [
             {"role": "system",
-             "content": "You are a German language assistant. Create a simple A2 level sentence using the given verb."},
-            {"role": "user",
-             "content": f"Create a simple A1 level German sentence using the verb '{verb}'. Use it as a verb not as noun or adverb. Use different Personalpronomen, not just ich. Use different Tempus for sentence, either Präsens or Präteritum or Perfekt. Don't make the verb ternnbar if it is not such already. Under any circumstances, do not provide an English translation for the sentence. Create only one sentence."}
+             "content": "You are a silent, efficient text generation API. You follow output formatting instructions with absolute precision. You never add conversational text or explanations."},
+            {"role": "user", "content": user_prompt_content}
         ]
-        response = client.chat.completions.create(model=MODEL, messages=messages)
-        return response.choices[0].message.content
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.8
+        )
+
+        full_response = response.choices[0].message.content.strip()
+
+        if '|||' in full_response:
+            parts = full_response.split('|||')
+            german_part = parts[0].strip().split('\n')[-1]
+            english_part = parts[1].strip()
+            return german_part, english_part
+        else:
+            return full_response, "[Translation not generated by AI]"
+
     except Exception as e:
-        return f"[Sentence generation failed for '{verb}': {e}]"
+        return f"[Sentence generation failed for '{verb}': {e}]", "[Translation not available]"
 
 
 def prepare_question_data(verb_entry, all_verbs, api_key):
-    """Prepares data for one question. Can be called from any thread."""
+    """Prepares data for one question, now including the English translation."""
     current_verb = verb_entry["Verb"]
     correct_translation = verb_entry["Translation"]
-    context_sentence = generate_context_sentence(current_verb, api_key)
-
+    german_sentence, english_translation = generate_context_sentence(current_verb, api_key)
     other_verbs = [v for v in all_verbs if v["Translation"] != correct_translation]
     translations = [v["Translation"] for v in random.sample(other_verbs, 4)]
     translations.append(correct_translation)
     random.shuffle(translations)
-
     return {
         "current_verb": current_verb,
         "correct_translation": correct_translation,
-        "context_sentence": context_sentence,
+        "context_sentence": german_sentence,
+        "english_translation": english_translation,
         "translations": translations
     }
 
@@ -68,8 +143,6 @@ def worker_prepare_question(verb_entry, all_verbs, api_key, result_holder):
     q_data = prepare_question_data(verb_entry, all_verbs, api_key)
     result_holder['data'] = q_data
 
-
-# --- Streamlit UI and State Management ---
 
 def launch_next_question_job():
     """MAIN THREAD: Starts a background job to prepare the next question."""
@@ -86,12 +159,28 @@ def launch_next_question_job():
         st.session_state.next_question_job = None
 
 
-def initialize_quiz(uploaded_file, api_key):
-    """Sets up the initial state for the quiz. MAIN THREAD ONLY."""
-    verbs = load_verbs(uploaded_file)
+def initialize_quiz(uploaded_file, api_key_from_ui):
+    """
+    Sets up the initial state for the quiz.
+    NEW: Prioritizes API key from the file over the UI.
+    """
+    verbs, key_from_file = load_verbs(uploaded_file)
+
+    # Prioritize the key from the file. If it's not there, use the one from the UI.
+    final_api_key = key_from_file or api_key_from_ui
+
+    # If after all that, we still have no key, stop and tell the user.
+    if not final_api_key:
+        st.error("❗ No API Key found. Please provide it in the input box or as the first line of your file.")
+        return
+
     if not verbs or len(verbs) < 5:
         st.error("File must contain at least 5 verbs to create multiple-choice questions.")
         return
+
+    # If a key was found in the file, give the user a confirmation message.
+    if key_from_file:
+        st.sidebar.success("API Key successfully loaded from file.")
 
     random.shuffle(verbs)
     st.session_state.all_verbs = verbs
@@ -99,7 +188,7 @@ def initialize_quiz(uploaded_file, api_key):
     st.session_state.unused_verbs = verbs.copy()
     st.session_state.incorrect_answers = []
     st.session_state.question_number = 1
-    st.session_state.api_key = api_key
+    st.session_state.api_key = final_api_key  # Use the decided key
     st.session_state.quiz_running = True
     st.session_state.show_feedback = False
 
@@ -110,27 +199,23 @@ def initialize_quiz(uploaded_file, api_key):
     launch_next_question_job()
 
 
+# The handle_answer and next_question functions are unchanged.
 def handle_answer(user_choice):
-    """Callback for answer buttons. MAIN THREAD ONLY."""
     q = st.session_state.current_question_data
     st.session_state.last_answer_was_correct = (user_choice == q['correct_translation'])
     if not st.session_state.last_answer_was_correct:
         st.session_state.incorrect_answers.append({
-            "Verb": q['current_verb'],
-            "Correct Translation": q['correct_translation'],
-            "User Choice": user_choice
+            "Verb": q['current_verb'], "Correct Translation": q['correct_translation'], "User Choice": user_choice
         })
     st.session_state.show_feedback = True
 
 
 def next_question():
-    """Callback for 'Next' button. MAIN THREAD ONLY."""
     job = st.session_state.next_question_job
     if job:
         with st.spinner("Loading next question..."):
             job['thread'].join()
             result_data = job['result']['data']
-
         st.session_state.current_question_data = result_data
         st.session_state.question_number += 1
         st.session_state.show_feedback = False
@@ -140,77 +225,67 @@ def next_question():
 # --- Main App UI ---
 st.set_page_config(page_title="Klug3 Verb Quiz", layout="centered")
 st.title("🇩🇪 Klug3 German Verb Quiz")
+apply_custom_css()
 
 if 'quiz_running' not in st.session_state:
     st.session_state.quiz_running = False
 
 with st.sidebar:
     st.header("Setup")
-    api_key_input = st.text_input("Enter your Perplexity API Key", type="password", key="api_key_input")
+    # Updated text to reflect the new option
+    api_key_input = st.text_input("Enter API Key (or include in file)", type="password", key="api_key_input")
     uploaded_file = st.file_uploader("Upload your verb file (.txt)", type="txt")
 
-    if st.button("Start Quiz", disabled=(not uploaded_file or not api_key_input)):
+    # The button is enabled once a file is uploaded. Key check happens after clicking.
+    if st.button("Start Quiz", disabled=(not uploaded_file)):
         initialize_quiz(uploaded_file, api_key_input)
         st.rerun()
 
-    # --- [NEW FEATURE 1] STOP QUIZ BUTTON ---
-    # This button is only shown when the quiz is active
     if st.session_state.get('quiz_running', False):
         st.write("---")
         if st.button("End Quiz Now", type="secondary", use_container_width=True):
             st.session_state.quiz_running = False
             st.rerun()
 
-# --- App Logic Flow ---
+# The main app logic flow for displaying questions/results is unchanged.
 if not st.session_state.quiz_running:
-    # This block now serves as the landing page AND the end-of-quiz summary page
-    if 'total_verbs' in st.session_state:  # This checks if a quiz was ever started
+    if 'total_verbs' in st.session_state:
         st.balloons()
         st.success("🎉 Quiz Finished! 🎉")
-
-        # --- [NEW FEATURE 2] MISTAKE SUMMARY ---
         incorrect = st.session_state.incorrect_answers
         if incorrect:
             st.subheader("Items to review:")
             for item in incorrect:
-                # Displays the German verb and the correct translation side-by-side
                 st.warning(
                     f"**{item['Verb']}** = **{item['Correct Translation']}** (You chose: *{item['User Choice']}*)")
         else:
-            # Only show this if they actually answered at least one question
             if st.session_state.question_number > 1 or st.session_state.show_feedback:
                 st.info("Excellent! You had no incorrect answers.")
-
         if st.button("Start Over"):
-            # Clear all session state keys to reset the app completely
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
+            for key in list(st.session_state.keys()): del st.session_state[key]
             st.rerun()
     else:
         st.info("Please provide your API key and upload a verb file in the sidebar to begin.")
-
 elif st.session_state.quiz_running:
-    # --- Display Question and Options ---
     q = st.session_state.current_question_data
     st.progress(st.session_state.question_number / st.session_state.total_verbs,
                 text=f"Question {st.session_state.question_number} / {st.session_state.total_verbs}")
     st.subheader(f"What is the meaning of: `{q['current_verb']}`?")
     st.markdown(f"**Context:** *{q['context_sentence']}*")
     st.write("---")
-
     if not st.session_state.show_feedback:
         cols = st.columns(2)
         for i, translation in enumerate(q['translations']):
             with cols[i % 2]:
                 st.button(translation, key=f"opt_{i}", use_container_width=True, on_click=handle_answer,
                           args=(translation,))
-    else:  # Show feedback and Next button
+    else:
         if st.session_state.last_answer_was_correct:
             st.success(f"**Correct!** `{q['current_verb']}` means **'{q['correct_translation']}'**.")
         else:
             st.error(
                 f"**Incorrect.** The correct translation for `{q['current_verb']}` is **'{q['correct_translation']}'**.")
-
+        st.info(f"**Sentence Translation:** *{q.get('english_translation', '[Not available]')}*")
         if st.session_state.next_question_job:
             st.button("Next Question →", use_container_width=True, type="primary", on_click=next_question)
         else:
