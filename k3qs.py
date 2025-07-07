@@ -7,7 +7,7 @@ import time
 
 # --- Core Quiz Logic (Thread-Safe) ---
 
-MODEL = "llama-3.1-sonar-small-128k-online"
+MODEL = "sonar-pro"
 
 
 def apply_custom_css():
